@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use indicatif::MultiProgress;
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -82,11 +82,12 @@ pub async fn run(opts: Opts) -> Result<()> {
         push_config,
     )
     .into_push_session(push_session_config);
+    let mut session_failure = session.failure_receiver();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        tx.send(res).unwrap();
+        let _ = tx.send(res);
     })?;
 
     watcher.watch(&store_dir, RecursiveMode::NonRecursive)?;
@@ -97,31 +98,56 @@ pub async fn run(opts: Opts) -> Result<()> {
         server = server_name.as_str(),
     );
 
-    while let Some(res) = rx.recv().await {
-        match res {
-            Ok(event) => {
-                // We watch the removals of lock files which signify
-                // store paths becoming valid
-                if let EventKind::Remove(_) = event.kind {
-                    let paths = event
-                        .paths
-                        .iter()
-                        .filter_map(|p| {
-                            let base = strip_lock_file(p)?;
-                            store.parse_store_path(base).ok()
-                        })
-                        .collect::<Vec<StorePath>>();
+    loop {
+        tokio::select! {
+            res = rx.recv() => {
+                let Some(res) = res else {
+                    return Err(anyhow!("store watcher stopped unexpectedly"));
+                };
 
-                    if !paths.is_empty() {
-                        session.queue_many(paths).unwrap();
+                match res {
+                    Ok(event) => {
+                        // We watch the removals of lock files which signify
+                        // store paths becoming valid
+                        if let EventKind::Remove(_) = event.kind {
+                            let paths = event
+                                .paths
+                                .iter()
+                                .filter_map(|p| {
+                                    let base = strip_lock_file(p)?;
+                                    store.parse_store_path(base).ok()
+                                })
+                                .collect::<Vec<StorePath>>();
+
+                            if !paths.is_empty() {
+                                session
+                                    .queue_many(paths)
+                                    .context("failed to queue store paths for push session")?;
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("Error during watch: {:?}", e),
                 }
             }
-            Err(e) => eprintln!("Error during watch: {:?}", e),
+            changed = session_failure.changed() => {
+                if changed.is_err() {
+                    return Err(anyhow!("push session failure monitor stopped unexpectedly"));
+                }
+
+                if let Some(failure) = session_failure.borrow().as_ref() {
+                    return Err(anyhow!("push session failed: {failure}"));
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                let results = session
+                    .wait()
+                    .await
+                    .context("failed to shut down push session")?;
+                results.into_values().collect::<Result<Vec<()>>>()?;
+                return Ok(());
+            }
         }
     }
-
-    Ok(())
 }
 
 fn strip_lock_file(p: &Path) -> Option<PathBuf> {

@@ -19,16 +19,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_channel as channel;
 use bytes::Bytes;
 use futures::future::join_all;
 use futures::stream::{Stream, TryStreamExt};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::{JoinHandle, spawn};
 use tokio::time;
 
@@ -104,6 +104,9 @@ pub struct PushSession {
 
     /// Receiver of results.
     result_receiver: mpsc::Receiver<Result<HashMap<StorePath, Result<()>>>>,
+
+    /// Receiver of background worker failures.
+    failure_receiver: watch::Receiver<Option<String>>,
 }
 
 enum SessionQueueCommand {
@@ -265,6 +268,7 @@ impl PushSession {
     pub fn with_pusher(pusher: Pusher, config: PushSessionConfig) -> Self {
         let (sender, receiver) = channel::unbounded();
         let (result_sender, result_receiver) = mpsc::channel(1);
+        let (failure_sender, failure_receiver) = watch::channel(None);
 
         let known_paths_mutex = Arc::new(Mutex::new(HashSet::new()));
 
@@ -278,6 +282,7 @@ impl PushSession {
             )
             .await
             {
+                let _ = failure_sender.send(Some(format!("{e:#}")));
                 let _ = result_sender.send(Err(e)).await;
             }
         });
@@ -285,6 +290,7 @@ impl PushSession {
         Self {
             sender,
             result_receiver,
+            failure_receiver,
         }
     }
 
@@ -348,7 +354,8 @@ impl PushSession {
                     config.no_closure,
                     config.ignore_upstream_cache_filter,
                 )
-                .await?;
+                .await
+                .context("failed to create push plan")?;
 
             let mut known_paths = known_paths_mutex.lock().await;
             plan.store_path_map
@@ -356,7 +363,10 @@ impl PushSession {
 
             // Push everything
             for (store_path_hash, path_info) in plan.store_path_map.into_iter() {
-                pusher.queue(path_info).await?;
+                pusher
+                    .queue(path_info)
+                    .await
+                    .with_context(|| format!("failed to queue upload job for {store_path_hash}"))?;
                 known_paths.insert(store_path_hash);
             }
 
@@ -381,6 +391,14 @@ impl PushSession {
             .recv()
             .await
             .expect("Nothing in result channel")
+    }
+
+    /// Subscribes to background worker failures.
+    ///
+    /// Long-running commands can use this to notice failures immediately
+    /// without consuming the normal completion result used by `wait`.
+    pub fn failure_receiver(&self) -> watch::Receiver<Option<String>> {
+        self.failure_receiver.clone()
     }
 
     /// Queues multiple store paths to be pushed.
@@ -413,9 +431,11 @@ impl PushPlan {
         let closure = if no_closure {
             roots
         } else {
+            let num_roots = roots.len();
             store
                 .compute_fs_closure_multi(roots, false, false, false)
-                .await?
+                .await
+                .with_context(|| format!("failed to compute closure for {num_roots} roots"))?
         };
 
         let mut store_path_map: HashMap<StorePathHash, ValidPathInfo> = {
@@ -427,13 +447,20 @@ impl PushPlan {
                     let path_hash = path.to_hash();
 
                     async move {
-                        let path_info = store.query_path_info(path).await?;
+                        let path_name = path.as_os_str().to_string_lossy().into_owned();
+                        let path_info = store.query_path_info(path).await.with_context(|| {
+                            format!("failed to query path info for {path_name}")
+                        })?;
                         Ok((path_hash, path_info))
                     }
                 })
                 .collect::<Vec<_>>();
 
-            join_all(futures).await.into_iter().collect::<Result<_>>()?
+            join_all(futures)
+                .await
+                .into_iter()
+                .collect::<Result<_>>()
+                .context("failed to query path info for push plan")?
         };
 
         let num_all_paths = store_path_map.len();
@@ -478,7 +505,12 @@ impl PushPlan {
         // Query missing paths
         let missing_path_hashes: HashSet<StorePathHash> = {
             let store_path_hashes = store_path_map.keys().map(|sph| sph.to_owned()).collect();
-            let res = api.get_missing_paths(cache, store_path_hashes).await?;
+            let res = api
+                .get_missing_paths(cache, store_path_hashes)
+                .await
+                .with_context(|| {
+                    format!("failed to query missing paths for cache {}", cache.as_str())
+                })?;
             res.missing_paths.into_iter().collect()
         };
         store_path_map.retain(|sph, _| missing_path_hashes.contains(sph));
@@ -622,7 +654,7 @@ impl<S: Stream<Item = AtticResult<Vec<u8>>>> NarStreamProgress<S> {
 impl<S: Stream<Item = AtticResult<Vec<u8>>> + Unpin> Stream for NarStreamProgress<S> {
     type Item = AtticResult<Vec<u8>>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.stream).as_mut().poll_next(cx) {
             Poll::Ready(Some(data)) => {
                 if let Ok(data) = &data {
